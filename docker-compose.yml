@@ -1,0 +1,46 @@
+name: paystrata-lab
+
+services:
+  db:
+    # The 8.4 tags are multi-arch (amd64 + arm64), so Apple Silicon works without extra flags.
+    # To pin a version: PS_TAG=8.4.10 docker compose up -d db
+    image: percona/percona-server:${PS_TAG:-8.4}
+    container_name: paystrata-db
+    environment:
+      MYSQL_ROOT_PASSWORD: paystrata
+      MYSQL_DATABASE: paystrata
+    ports:
+      - "3307:3306"
+    command:
+      - --innodb-print-all-deadlocks=ON
+      - --innodb-lock-wait-timeout=5
+      - --max-connections=300
+      - --innodb-buffer-pool-size=512M
+      - --performance-schema=ON
+    volumes:
+      - ./sql/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./sql/02_seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-ppaystrata"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Load generator. Run with:  docker compose run --rm loadgen ramp
+  loadgen:
+    build: ./loadgen
+    profiles: ["tools"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: paystrata
+      DB_NAME: paystrata
+    volumes:
+      - ./loadgen:/app
+      - ./sql:/sql:ro
+      - ./results:/results
+    entrypoint: ["python", "/app/loadgen.py"]

@@ -1,0 +1,223 @@
+PAYSTRATA LAB: THE BOTTLENECK THAT ONLY APPEARS AT PEAK HOURS
+============================================================
+
+THE STORY
+---------
+PayStrata counts payments per merchant per day with INSERT ... ON DUPLICATE KEY UPDATE
+(called IODKU below). Every test in DEV and QA passes and every query is fast. As traffic
+grows during the day, PROD slows down. You reproduce it, find the cause with MySQL's own
+tools, and redesign the statement.
+
+
+THE TWO TESTS
+-------------
+TEST 1  IODKU versus the redesign (UPDATE first, INSERT only if missing)
+        ramp 1 -> 50 sessions, REPEATABLE READ (the MySQL default)
+        chart: payments per second, p95, deadlocks      ->  results/test1.png
+
+TEST 2  IODKU only, REPEATABLE READ versus READ COMMITTED
+        ramp 1 -> 50 sessions, no redesign
+        chart: payments per second, p95, deadlocks      ->  results/test2.png
+
+Each test starts by rebuilding the environment from scratch (containers, network, data).
+
+
+FILES IN THIS FOLDER
+--------------------
+  LAB_GUIDE.txt       this guide
+  test_commands.txt   the commands of both tests, ready to copy
+  setup_env.sh        rebuilds the environment from scratch, runs NO test
+  test1.sh            Test 1: rebuild, ramp IODKU and redesign, chart
+  test2.sh            Test 2: rebuild, ramp RR and RC, chart
+  run_all.sh          Test 1, then Test 2, then destroys everything
+  monitor.sh          live lock monitor, for a second terminal
+  plot.py             chart of Test 1
+  plot_isolation.py   chart of Test 2
+
+
+RUN IT
+------
+Optional, in a second terminal (it shows the locks live):
+
+    ./monitor.sh
+
+Then, in the first terminal:
+
+    chmod +x *.sh
+    ./test1.sh
+
+and, when you want the second test:
+
+    ./test2.sh
+
+Or both, with a clean destroy at the end:
+
+    ./run_all.sh
+
+If you only want the environment, without any test:
+
+    ./setup_env.sh
+
+The same commands, one by one, are in test_commands.txt.
+
+
+SETUP (ONCE)
+------------
+1. Start the Docker runtime with enough memory:
+
+    colima start --cpu 4 --memory 8
+
+2. Check that everything is there:
+
+    colima status
+    docker-compose version
+    python3 --version
+
+3. Python environment for the charts:
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python3 -m pip install matplotlib
+    deactivate
+
+If your machine has "docker compose" (with a space) instead of "docker-compose", use that.
+On Windows use Docker Desktop with WSL2 and run everything from the Ubuntu terminal;
+skip the Colima steps.
+
+
+WHAT THE LOAD GENERATOR DOES
+----------------------------
+Commands:
+
+  ramp   the same test at 1, 5, 10, 25 and 50 sessions, one level after another.
+         This is the story: "everything is fine with 1 session, until it is not".
+  run    one variant at one number of sessions (quick checks)
+  reset  empty and reload the table
+
+For every level, for 20 seconds (change it with --duration):
+
+  - The table is emptied and reloaded (19,000 merchants), so every level starts from the
+    same data. This happens before the timer starts and is not measured.
+  - Every session repeats one "payment": one transaction that updates 3 merchants in random
+    order, with a 2 ms pause between statements.
+  - 80% of the traffic goes to the first 1,000 merchants. 5% of the keys do not exist yet.
+  - On a deadlock (error 1213) the payment is rolled back and retried, up to 3 more times.
+
+What it prints (a row appears as soon as a level finishes):
+
+  isolation        REPEATABLE READ or READ COMMITTED
+  payments_per_s   payments completed per second
+  p50_ms, p95_ms   time from start of a payment to commit (retries included).
+                   p95 = 95% of payments finished at or below this time
+  deadlocks        how many times a deadlock happened (counts attempts, not payments)
+  lock_timeouts    waits longer than 5 seconds
+  failed_payments  payments that still failed after the retries
+
+Options: --duration 30, --think-ms 2, --isolation "READ COMMITTED", --out NAME (saves
+results/NAME.csv).
+
+
+WHAT TO EXPECT
+--------------
+Numbers vary by laptop, plus or minus 30%. The pattern must not change.
+
+Test 1:  with 1 session about 100 payments per second, p95 about 12 ms, 0 deadlocks.
+         IODKU: deadlocks from 5 sessions on; at 50 sessions 250 payments per second,
+         p95 506 ms, 11,219 deadlocks.
+         Redesign: at 50 sessions 2,907 payments per second, p95 27 ms, 4 deadlocks.
+
+Test 2:  one run at 50 sessions gave
+             REPEATABLE READ    255 payments/s, p95 465 ms, 12,881 deadlocks
+             READ COMMITTED   2,838 payments/s, p95  28 ms,      2 deadlocks
+         IODKU takes gap and next-key locks under REPEATABLE READ. READ COMMITTED takes far
+         fewer gap locks, so most of the problem disappears. It is not a free fix: it changes
+         what every transaction in the application can see, and replication needs
+         binlog_format=ROW. Changing the statement fixes the problem without changing the
+         rules for the rest of the application.
+
+
+THE MONITOR (monitor.sh)
+------------------------
+    ./monitor.sh           refresh every 6 seconds (default)
+    ./monitor.sh 10        refresh every 10 seconds
+    ./monitor.sh 8 keep    keep every snapshot in the scrollback
+    ./monitor.sh once      one snapshot, then exit (use it to test the monitor)
+
+To freeze the screen while you talk, press Ctrl+S. Ctrl+Q resumes. Ctrl+C stops it.
+
+The four panels:
+
+  1. Sessions and transactions    transactions piling up in LOCK WAIT
+  2. Who blocks whom              session pairs waiting on each other (SQL cut to 45 characters)
+  3. Locks by index and mode      IODKU: X, X,GAP and X,INSERT_INTENTION waiting
+                                  UPDATE first: mostly X,REC_NOT_GAP
+  4. Deadlocks and lock waits     the counters since the server started
+
+How to read a lock mode:
+
+  X                     next-key lock: the row plus the gap before it
+  X,REC_NOT_GAP         the row only
+  X,GAP                 the gap only
+  X,INSERT_INTENTION    an insert that wants to go into a gap
+
+Test the monitor before the session (all 4 panels must print without an error):
+
+    ./monitor.sh once
+
+
+FIND THE CAUSE BY HAND (during or after a ramp)
+-----------------------------------------------
+    docker exec -it paystrata-db mysql -uroot -ppaystrata paystrata
+
+Then, inside MySQL:
+
+    SHOW ENGINE INNODB STATUS\G
+    SELECT * FROM performance_schema.data_locks\G
+    SELECT * FROM sys.innodb_lock_waits\G
+
+Look for "LATEST DETECTED DEADLOCK". Only the last deadlock, trimmed:
+
+    docker exec paystrata-db mysql -uroot -ppaystrata paystrata -e "SHOW ENGINE INNODB STATUS\G" 2>/dev/null | sed -n '/LATEST DETECTED DEADLOCK/,/WE ROLL BACK/p' | cut -c1-170
+
+Throughput straight from the server. TPS = commits in a window / seconds in the window.
+Run it inside MySQL while a test is running:
+
+    SELECT VARIABLE_VALUE INTO @c1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Com_commit';
+    SELECT SLEEP(10);
+    SELECT VARIABLE_VALUE INTO @c2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Com_commit';
+    SELECT (@c2 - @c1) / 10 AS tps;
+
+
+CLEAN UP
+--------
+    docker-compose down -v        destroys the containers, the network and the data volume
+    colima stop                   stops the Docker runtime
+
+
+EXPERIMENTS TO TRY
+------------------
+1. --think-ms 0 versus --think-ms 10: why does the time between statements matter?
+2. Sort the 3 merchant ids before updating (search for random.shuffle in loadgen/loadgen.py).
+3. Set MAX_RETRIES = 0 in loadgen/loadgen.py: how many payments fail now?
+
+Mini-challenge: rewrite this statement as UPDATE-then-INSERT and explain which locks
+disappear and which race condition you must still handle.
+
+    INSERT INTO merchant_daily_stats (merchant_id, stat_date, txn_count, total_amount)
+    VALUES (4242, '2026-03-01', 1, 55.00) AS incoming
+    ON DUPLICATE KEY UPDATE
+      txn_count = merchant_daily_stats.txn_count + 1,
+      total_amount = merchant_daily_stats.total_amount + incoming.total_amount;
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+  "command not found: docker-compose"   run: brew install docker-compose
+  "the input device is not a TTY"       add -T after "run --rm" (the scripts already do)
+  Port 3307 is busy                     change 3307:3306 in docker-compose.yml
+  Database does not become healthy      docker-compose logs db
+  The test is killed or MySQL restarts  more memory: colima stop, then
+                                        colima start --cpu 4 --memory 12
+  IODKU shows no deadlocks              check that Colima has at least 4 CPUs
+  The chart is empty or missing         run the ramp first; Test 1 needs results/test1.csv,
+                                        Test 2 needs results/test2_rr.csv and test2_rc.csv

@@ -1,0 +1,102 @@
+TEST COMMANDS: TWO TESTS
+========================
+
+Run the commands from the paystrata-lab folder, one block at a time.
+If you use "docker compose" (with a space), replace "docker-compose" with it.
+Optional, in a second terminal while a test runs:   ./monitor.sh
+
+A "ramp" runs 1, 5, 10, 25 and 50 concurrent sessions, one level after another, 20 seconds
+each. A row is printed as soon as each level finishes. Before every level the table is
+emptied and reloaded (19,000 merchants), so every level starts from the same data.
+
+
+TEST 1: IODKU versus the redesign, ramp 1 -> 50 sessions
+========================================================
+What it shows: the same server, the same data, the same traffic. Only the SQL statement
+changes. IODKU flattens and deadlocks, UPDATE first scales almost linearly.
+Chart: payments per second, p95, deadlocks.
+
+A) One script (rebuilds the environment first):
+
+    ./test1.sh
+
+B) Or by hand:
+
+    ./setup_env.sh
+
+    docker-compose run --rm loadgen ramp --out test1
+
+    source .venv/bin/activate
+    python plot.py
+    deactivate
+
+The ramp prints IODKU 1 -> 50 first, then UPDATE first (the redesign) 1 -> 50.
+Numbers: results/test1.csv     Chart: results/test1.png
+
+
+TEST 2: IODKU only, REPEATABLE READ versus READ COMMITTED, ramp 1 -> 50 sessions
+=================================================================================
+What it shows: the same IODKU statement, only the isolation level changes. No redesign.
+Chart: payments per second, p95, deadlocks.
+
+A) One script (rebuilds the environment first):
+
+    ./test2.sh
+
+B) Or by hand:
+
+    ./setup_env.sh
+
+    docker-compose run --rm loadgen ramp --variants iodku --out test2_rr
+
+    docker-compose run --rm loadgen ramp --variants iodku --isolation "READ COMMITTED" --out test2_rc
+
+    source .venv/bin/activate
+    python plot_isolation.py
+    deactivate
+
+Numbers: results/test2_rr.csv and results/test2_rc.csv     Chart: results/test2.png
+
+
+BOTH TESTS, THEN DESTROY EVERYTHING
+-----------------------------------
+    ./run_all.sh
+
+Each test rebuilds the environment first. To destroy the containers after one test:
+
+    DESTROY=1 ./test1.sh
+    DESTROY=1 ./test2.sh
+
+
+EXTRAS (optional)
+-----------------
+One level only, for a quick check (add --isolation "READ COMMITTED" if you want):
+
+    docker-compose run --rm loadgen run --variant iodku --threads 1
+    docker-compose run --rm loadgen run --variant iodku --threads 50 --duration 30
+    docker-compose run --rm loadgen run --variant update_insert --threads 50 --duration 30
+
+Longer levels: add  --duration 30  to any command.
+
+Throughput straight from the server (inside MySQL, while a test runs):
+
+    docker exec -it paystrata-db mysql -uroot -ppaystrata paystrata
+
+    SELECT VARIABLE_VALUE INTO @c1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Com_commit';
+    SELECT SLEEP(10);
+    SELECT VARIABLE_VALUE INTO @c2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Com_commit';
+    SELECT (@c2 - @c1) / 10 AS tps;
+
+Last deadlock, trimmed:
+
+    docker exec paystrata-db mysql -uroot -ppaystrata paystrata -e "SHOW ENGINE INNODB STATUS\G" 2>/dev/null | sed -n '/LATEST DETECTED DEADLOCK/,/WE ROLL BACK/p' | cut -c1-170
+
+Destroy the containers and the data volume:
+
+    docker-compose down -v
+
+
+NOTE FOR THE LIVE MONITOR
+-------------------------
+The deadlock counter in monitor panel 4 is cumulative since the server started. Each test
+starts with ./setup_env.sh, which rebuilds the server, so the counter starts at zero.
